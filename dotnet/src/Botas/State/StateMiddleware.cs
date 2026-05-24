@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -13,6 +14,13 @@ internal class StateMiddleware : ITurnMiddleWare
     private readonly IStorage _storage;
     private readonly ILogger? _logger;
 
+    /// <summary>
+    /// Per-key semaphores that serialize the load → handler → save sequence for
+    /// a given (conversation, user) pair. Prevents lost updates when concurrent
+    /// turns for the same keys race (Issue #365, parity with Python fix).
+    /// </summary>
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _stateLocks = new();
+
     public StateMiddleware(IStorage storage, ILogger? logger = null)
     {
         _storage = storage;
@@ -21,50 +29,64 @@ internal class StateMiddleware : ITurnMiddleWare
 
     public async Task OnTurnAsync(TurnContext context, NextDelegate next, CancellationToken cancellationToken = default)
     {
-        // Load state at turn start
-        TurnState state;
+        // Derive lock key from conversation + user before loading state
+        var conversationKey = GetConversationKey(context.Activity);
+        var userKey = GetUserKey(context.Activity);
+        var lockKey = $"{conversationKey ?? "null"}|{userKey ?? "null"}";
+
+        var semaphore = _stateLocks.GetOrAdd(lockKey, _ => new SemaphoreSlim(1, 1));
+        await semaphore.WaitAsync(cancellationToken);
         try
         {
-            state = await LoadStateAsync(context.Activity, cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError(ex, "Failed to load state for conversation {ConversationId}", context.Activity.Conversation?.Id);
-            throw new StateLoadException("Failed to load state from storage", ex);
-        }
-
-        // Attach state to context
-        context.SetState(state);
-
-        // Call next middleware/handler
-        Exception? thrownException = null;
-        try
-        {
-            await next(cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            // Capture exception but don't save state
-            thrownException = ex;
-        }
-
-        // Save state ONLY if next() succeeded (no exception)
-        if (thrownException is null)
-        {
+            // Load state at turn start
+            TurnState state;
             try
             {
-                await SaveStateAsync(state, cancellationToken);
+                state = await LoadStateAsync(context.Activity, cancellationToken);
             }
             catch (Exception ex)
             {
-                _logger?.LogError(ex, "Failed to save state for conversation {ConversationId}", context.Activity.Conversation?.Id);
-                throw new StateSaveException("Failed to save state to storage", ex);
+                _logger?.LogError(ex, "Failed to load state for conversation {ConversationId}", context.Activity.Conversation?.Id);
+                throw new StateLoadException("Failed to load state from storage", ex);
+            }
+
+            // Attach state to context
+            context.SetState(state);
+
+            // Call next middleware/handler
+            Exception? thrownException = null;
+            try
+            {
+                await next(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                // Capture exception but don't save state
+                thrownException = ex;
+            }
+
+            // Save state ONLY if next() succeeded (no exception)
+            if (thrownException is null)
+            {
+                try
+                {
+                    await SaveStateAsync(state, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Failed to save state for conversation {ConversationId}", context.Activity.Conversation?.Id);
+                    throw new StateSaveException("Failed to save state to storage", ex);
+                }
+            }
+            else
+            {
+                // Re-throw the original exception (state changes are discarded)
+                ExceptionDispatchInfo.Capture(thrownException).Throw();
             }
         }
-        else
+        finally
         {
-            // Re-throw the original exception (state changes are discarded)
-            ExceptionDispatchInfo.Capture(thrownException).Throw();
+            semaphore.Release();
         }
     }
 
