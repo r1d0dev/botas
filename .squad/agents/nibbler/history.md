@@ -210,3 +210,26 @@
   - Tests now match the exact command strings that test-bot implementations expect
   - New `waitForBotReplyMatching()` helper is reusable for any non-echo reply pattern
 - **Lesson:** When a test suite uses nonce-based correlation for echo tests, non-echo commands (counter, reset, mention, card) that require exact string matches need a separate helper (`sendRawMessage`) and matcher (`waitForBotReplyMatching`). The two patterns serve different purposes: echo tests verify round-trip fidelity (need nonces), command tests verify handler dispatch (need exact strings).
+
+### 2026-05-23 — PR #367 Review: Python State Per-Key Async Lock (#365)
+
+- **Branch:** `squad/365-python-state-race-lock`
+- **Changes:** Python `_get_state_lock()` per-key async lock wrapping load → handler → save sequence; regression test `test_concurrent_turns_for_same_user_preserve_both_updates`
+
+**Test Results:**
+
+| Language | Passed | Failed | Skipped | Notes |
+|---|---|---|---|---|
+| Python | 217 | 0 | 13 | ✅ All state-tagged tests (65/65) green |
+| .NET | 169 + 9 | 0 | 1 + 7 | ✅ No regressions |
+| Node.js | 185 + 12 + 9 | **6** | 0 + 0 + 1 | ❌ 6 FileStorage test failures — **pre-existing** (Node v26 `fs.rmdir` removed `recursive` option; fails same on `main` |
+
+**Regression Test Assessment:**
+- ✅ Uses `asyncio.gather(bot.process_body(...), bot.process_body(...))` for genuine concurrency
+- ✅ `asyncio.sleep(0.01)` inside handler creates a realistic race window (both turns read count=0 before either writes)
+- ✅ Assertion `count == 2` correctly validates lock serialization (would be `count == 1` without lock, intermittently)
+- ✅ Test follows the pattern described in `.squad/skills/per-key-async-lock/SKILL.md`
+- ⚠️ Gap: No test that concurrent turns for **different** keys proceed in parallel. Decision #86 mentions this but no regression test covers it.
+- ⚠️ Gap: Parity audits #368 (.NET) and #369 (Node) filed but not yet resolved.
+
+**Verdict:** PR #367 is safe to merge. The 6 Node failures are pre-existing (Node v26 compat issue in `file-storage.spec.ts` — `fs.rmdir` with `recursive: true` removed). The Python change is correct and the regression test is solid.

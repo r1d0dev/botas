@@ -9,7 +9,7 @@ import type { TurnContext } from './turn-context.js'
 import { createTurnContext } from './turn-context.js'
 import { ConversationClient } from './conversation-client.js'
 import type { Storage } from './state/storage.js'
-import { TurnStateImpl } from './state/turn-state.js'
+import { TurnStateImpl, deriveConversationKey, deriveUserKey } from './state/turn-state.js'
 
 import { TokenManager } from './token-manager.js'
 import type { BotApplicationOptions } from './bot-application-options.js'
@@ -97,6 +97,14 @@ export class BotApplication {
   private readonly invokeHandlers = new Map<string, InvokeActivityHandler>()
   private readonly tokenManager: TokenManager
   private storage?: Storage
+
+  /**
+   * Per-key promise chain for serializing state load → handler → save.
+   * Keyed by composite "(conversation_key)::(user_key)" so concurrent turns
+   * for the same conversation+user pair do not overwrite each other's changes.
+   * @internal
+   */
+  private readonly _stateLocks = new Map<string, Promise<void>>()
 
   /**
    * Create a new BotApplication.
@@ -341,72 +349,109 @@ export class BotApplication {
     })
   }
 
+  /**
+   * Derive a composite state lock key from an activity.
+   * Returns the key as `{conversationKey}::{userKey}`.
+   */
+  private _getStateKey(activity: CoreActivity): string {
+    const convKey = deriveConversationKey(activity)
+    const userKey = deriveUserKey(activity)
+    return `${convKey}::${userKey}`
+  }
+
+  /**
+   * Serialize state operations per key.
+   * Awaits any in-flight operation on the same key, then runs `fn`.
+   * Always resolves the next-waiter promise so the chain never deadlocks,
+   * even when `fn` throws.
+   */
+  private async _runWithStateLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this._stateLocks.get(key) ?? Promise.resolve()
+    let resolveNext: () => void
+    const next = new Promise<void>((resolve) => { resolveNext = resolve })
+    this._stateLocks.set(key, next)
+    try {
+      await prev
+      return await fn()
+    } finally {
+      resolveNext!()
+    }
+  }
+
   private async runPipelineAsync (activity: CoreActivity): Promise<InvokeResponse | undefined> {
-    // Load state if configured (per spec: load before middleware)
-    let state: TurnStateImpl | undefined
-    if (this.storage) {
-      try {
-        state = await TurnStateImpl.loadAsync(this.storage, activity)
-      } catch (err) {
-        getLogger().error('State load failed: %s', err instanceof Error ? err.message : String(err))
-        throw new Error('State load failed — turn aborted')
+    // Compute per-key lock key to serialize load → handler → save for the
+    // same conversation+user pair, preventing lost updates (#365).
+    const stateKey = this.storage ? this._getStateKey(activity) : undefined
+
+    const body = async (): Promise<InvokeResponse | undefined> => {
+      // Load state if configured (per spec: load before middleware)
+      let state: TurnStateImpl | undefined
+      if (this.storage) {
+        try {
+          state = await TurnStateImpl.loadAsync(this.storage, activity)
+        } catch (err) {
+          getLogger().error('State load failed: %s', err instanceof Error ? err.message : String(err))
+          throw new Error('State load failed — turn aborted')
+        }
       }
+
+      const context = createTurnContext(this, activity, state)
+      let invokeResponse: InvokeResponse | undefined
+      let index = 0
+      const metrics = getMetrics()
+      const next = async (): Promise<void> => {
+        if (index < this.middlewares.length) {
+          const mw = this.middlewares[index++]!
+          let nextPromise: Promise<void> | undefined
+          const trackedNext = (): Promise<void> => {
+            nextPromise = next()
+            return nextPromise
+          }
+          const mwStart = Date.now()
+          const mwName = mw.name || `middleware-${index - 1}`
+          await withActiveSpan('botas.middleware', async (mwSpan) => {
+            mwSpan?.setAttribute('middleware.name', mwName)
+            mwSpan?.setAttribute('middleware.index', index - 1)
+            try {
+              await mw(context, trackedNext)
+            } catch (err) {
+              // Suppress the detached next() rejection — the middleware error takes priority
+              if (nextPromise) await nextPromise.catch(() => {})
+              throw err
+            } finally {
+              metrics?.middlewareDuration.record(Date.now() - mwStart, { 'middleware.name': mwName })
+            }
+          })
+          if (nextPromise) await nextPromise
+        } else {
+          invokeResponse = await this.handleCoreActivityAsync(context)
+        }
+      }
+      
+      let pipelineSucceeded = false
+      try {
+        await next()
+        pipelineSucceeded = true
+      } catch (err) {
+        if (err instanceof BotHandlerException) throw err
+        // #67: Propagate middleware errors with original message
+        throw err
+      } finally {
+        // Save state if configured and pipeline succeeded (per spec: atomic semantics)
+        if (state && pipelineSucceeded) {
+          try {
+            await state.saveAsync()
+          } catch (err) {
+            // Log but don't fail the response (per spec: turn already completed)
+            getLogger().error('State save failed: %s', err instanceof Error ? err.message : String(err))
+          }
+        }
+      }
+      
+      return invokeResponse
     }
 
-    const context = createTurnContext(this, activity, state)
-    let invokeResponse: InvokeResponse | undefined
-    let index = 0
-    const metrics = getMetrics()
-    const next = async (): Promise<void> => {
-      if (index < this.middlewares.length) {
-        const mw = this.middlewares[index++]!
-        let nextPromise: Promise<void> | undefined
-        const trackedNext = (): Promise<void> => {
-          nextPromise = next()
-          return nextPromise
-        }
-        const mwStart = Date.now()
-        const mwName = mw.name || `middleware-${index - 1}`
-        await withActiveSpan('botas.middleware', async (mwSpan) => {
-          mwSpan?.setAttribute('middleware.name', mwName)
-          mwSpan?.setAttribute('middleware.index', index - 1)
-          try {
-            await mw(context, trackedNext)
-          } catch (err) {
-            // Suppress the detached next() rejection — the middleware error takes priority
-            if (nextPromise) await nextPromise.catch(() => {})
-            throw err
-          } finally {
-            metrics?.middlewareDuration.record(Date.now() - mwStart, { 'middleware.name': mwName })
-          }
-        })
-        if (nextPromise) await nextPromise
-      } else {
-        invokeResponse = await this.handleCoreActivityAsync(context)
-      }
-    }
-    
-    let pipelineSucceeded = false
-    try {
-      await next()
-      pipelineSucceeded = true
-    } catch (err) {
-      if (err instanceof BotHandlerException) throw err
-      // #67: Propagate middleware errors with original message
-      throw err
-    } finally {
-      // Save state if configured and pipeline succeeded (per spec: atomic semantics)
-      if (state && pipelineSucceeded) {
-        try {
-          await state.saveAsync()
-        } catch (err) {
-          // Log but don't fail the response (per spec: turn already completed)
-          getLogger().error('State save failed: %s', err instanceof Error ? err.message : String(err))
-        }
-      }
-    }
-    
-    return invokeResponse
+    return stateKey ? this._runWithStateLock(stateKey, body) : body()
   }
 }
 
